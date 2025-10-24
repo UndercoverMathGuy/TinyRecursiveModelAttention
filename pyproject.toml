@@ -5,6 +5,10 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "dataclasses>=0.8",
+    "fastparquet>=2024.11.0",
     "pandas>=2.3.3",
+    "pyarrow>=21.0.0",
     "torch>=2.9.0",
+    "tqdm>=4.67.1",
 ]
