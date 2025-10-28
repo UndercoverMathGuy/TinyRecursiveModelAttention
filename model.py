@@ -1,6 +1,6 @@
 import torch.nn as nn
 import torch.nn.functional as F
-from data.data_aug import DataTensor, TensorAugmented
+from data_sudoku.data_aug import DataTensor, TensorAugmented
 
 class SwiGLU(nn.Module):
     def __init__(self, in_dim, hidden_dim, dropout=0.0, out_dim=None):
