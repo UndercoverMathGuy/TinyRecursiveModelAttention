@@ -39,7 +39,7 @@ class DataTensor:
         one_hots = one_hots.float().to(device)
         masks = masks.to(device)
         if col_question==True:
-            return one_hots, mask_given
+            return one_hots, mask_given.to_device(device)
         else:
             return one_hots
     
@@ -165,3 +165,6 @@ class TensorAugmented:
         full_df = pandas.concat(frames, axis=0, ignore_index=True)
         full_df.drop_duplicates(subset=['question', 'answer'], inplace=True)
         return self.tensor.switch_df(full_df.reset_index(drop=True))
+
+    def to_tensors(self, device, col_question=True):
+        return self.tensor.to_tensors(device, col_question)
