@@ -1,5 +1,6 @@
 from typing import Tuple
 import einops
+from sympy.geometry.entity import scale
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -149,12 +150,13 @@ class LinearSwish(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    def __init__(self, hidden_size: int, expansion: float):
+    def __init__(self, hidden_size: int, expansion: float, dropout: float = 0.01):
         super().__init__()
         inter = _find_multiple(round(expansion * hidden_size * 2 / 3), 256)
 
         self.gate_up_proj = CastedLinear(hidden_size, inter * 2, bias=False)
         self.down_proj    = CastedLinear(inter, hidden_size, bias=False)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
@@ -167,3 +169,77 @@ def rms_norm(hidden_states: torch.Tensor, variance_epsilon: float) -> torch.Tens
     variance = hidden_states.square().mean(-1, keepdim=True)
     hidden_states = hidden_states * torch.rsqrt(variance + variance_epsilon)
     return hidden_states.to(input_dtype)
+
+class AttentionMap(nn.Module):
+    def __init__(self, emb_dim, hidden_dim, block_size=64):
+        super().__init__()
+        self.emb_dim = emb_dim
+        self.hidden_dim = hidden_dim
+        self.block_size = block_size
+        self.query = CastedLinear(emb_dim, hidden_dim, bias=False)
+        self.key   = CastedLinear(emb_dim, hidden_dim, bias=False)
+
+    def naive(self, x):
+        q = self.query(x)                         # [B, L, H]
+        k = self.key(x)                           # [B, L, H]
+        s = torch.einsum('b i h, b j h -> b i j', q, k) / (self.hidden_dim ** 0.5)
+        return s                                  # [B, L, L]
+
+    def flash_raw(self, x):
+        # Block-tiled matmul
+        B, L, _ = x.shape
+        q = self.query(x) * (self.hidden_dim ** -0.5)
+        k = self.key(x)
+
+        s = x.new_zeros(B, L, L)
+        for i in range(0, L, self.block_size):
+            i_end = min(i + self.block_size, L)
+            q_blk = q[:, i:i_end]                 # [B, Ii, H]
+            for j in range(0, L, self.block_size):
+                j_end = min(j + self.block_size, L)
+                k_blk = k[:, j:j_end]             # [B, Jj, H]
+                s[:, i:i_end, j:j_end] = torch.einsum('b i h, b j h -> b i j', q_blk, k_blk)
+        return s
+
+    def forward(self, x):
+        return self.flash_raw(x)
+
+class AttentionLinks(nn.Module):
+    def __init__ (self, emb_dim, sparse:bool, topu, tau, swiglu_exp, p=64, h=256, block_size=64, dropout=0.01):
+        super().__init__()
+        self.emb_dim = emb_dim
+        self.sparse = sparse
+        self.topu = topu
+        self.tau = tau
+        self.swiglu_exp = swiglu_exp
+        self.p = p
+        self.h = h
+        self.block_size = block_size
+        self.attn_map = AttentionMap(emb_dim, emb_dim, block_size)    
+        self.swiglu = SwiGLU(h, h*swiglu_exp, dropout=dropout)
+        self.w1 = nn.Linear(emb_dim, h, bias=True)
+        self.w2 = nn.Linear(h, p, bias=False)
+        self.norm = nn.LayerNorm(p)
+        
+    def forward(self, x):
+        S = self.attn_map(x)
+        S = torch.softmax(S, dim=-1)
+        weighted_in = self.w1(x)
+        swiglu_out = self.swiglu(weighted_in)
+        swiglu_weighted = self.w2(swiglu_out)
+        C = self.norm(swiglu_weighted)
+        C = F.normalize(C, p=2, dim=-1)
+
+        A = torch.matmul(S, C)
+        A = F.normalize(A, p=2, dim=-1)
+        
+        J = torch.matmul(A, C.transpose(-1, -2))
+        J = J - torch.diag_embed(torch.diag(J, dim1=-2, dim2=-1))
+        val, idx = torch.topk(J, k=self.topu, dim=-1)
+
+        if self.sparse:
+            J_sparse = torch.zeros_like(J).scatter_(-1, idx, val), idx
+            return J_sparse, idx, val, A, C
+        else:
+            return J, A, C
+
