@@ -143,6 +143,17 @@ wheels = [
 ]
 
 [[package]]
+name = "entmax"
+version = "1.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "torch" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/06/a0/71747f0d98e441d0670b06205afd24d832e88c0ee62129ca47ce88505304/entmax-1.3-py3-none-any.whl", hash = "sha256:41bb1edbd497a1b53b1f0fc80befd543499dc704b4e5436ddf6c5728a2d00546", size = 13359, upload-time = "2024-02-07T10:09:38.865Z" },
+]
+
+[[package]]
 name = "filelock"
 version = "3.20.0"
 source = { registry = "https://pypi.org/simple" }
@@ -891,6 +902,7 @@ dependencies = [
     { name = "argdantic" },
     { name = "coolname" },
     { name = "einops" },
+    { name = "entmax" },
     { name = "huggingface-hub" },
     { name = "hydra-core" },
     { name = "importlib" },
@@ -915,6 +927,7 @@ requires-dist = [
     { name = "argdantic", specifier = ">=1.3.3" },
     { name = "coolname", specifier = ">=2.2.0" },
     { name = "einops", specifier = ">=0.8.1" },
+    { name = "entmax", specifier = ">=1.3" },
     { name = "huggingface-hub", specifier = ">=1.0.1" },
     { name = "hydra-core", specifier = ">=1.3.2" },
     { name = "importlib", specifier = ">=1.0.4" },
