@@ -170,60 +170,21 @@ def rms_norm(hidden_states: torch.Tensor, variance_epsilon: float) -> torch.Tens
     hidden_states = hidden_states * torch.rsqrt(variance + variance_epsilon)
     return hidden_states.to(input_dtype)
 
-class AttentionMap(nn.Module):
-    def __init__(self, emb_dim, hidden_dim, block_size=64):
+class FlashAttentionLinks(nn.Module):
+    def __init__ (self, emb_dim, hidden_dim, C_temp=1.0, F_temp=1.0, S_temp=1.0):
         super().__init__()
         self.emb_dim = emb_dim
         self.hidden_dim = hidden_dim
-        self.block_size = block_size
         self.query = nn.Linear(emb_dim, hidden_dim, bias=False)
-        self.key   = nn.Linear(emb_dim, hidden_dim, bias=False)
-
-    def flash_raw(self, x, qk_release=False):
-        # Block-tiled matmul
-        B, L, _ = x.shape
-        q = self.query(x) * (self.hidden_dim ** -0.5)
-        k = self.key(x)
-
-        s = x.new_zeros(B, L, L)
-        for i in range(0, L, self.block_size):
-            i_end = min(i + self.block_size, L)
-            q_blk = q[:, i:i_end]                 # [B, Ii, H]
-            for j in range(0, L, self.block_size):
-                j_end = min(j + self.block_size, L)
-                k_blk = k[:, j:j_end]             # [B, Jj, H]
-                s[:, i:i_end, j:j_end] = torch.einsum('b i h, b j h -> b i j', q_blk, k_blk)
-        if qk_release:
-            return s, q, k
-        else:
-            return s
-
-    def flash(self, x):
-        return flash_attn_func(
-            query=self.query(x),
-            key=self.key(x),
-            value=x,
-            qk_release = False,
-            dropout=0.0)/self.hidden_dim**0.5
-
-    def forward(self, x):
-        return self.flash(x)
-
-class AttentionLinks(nn.Module):
-    def __init__ (self, emb_dim, hidden_dim, q = 0.9, single_tau = 0.5, abs_floor = 0.0, C_temp=1.0, F_temp=1.0):
-        super().__init__()
-        self.emb_dim = emb_dim
-        self.hidden_dim = hidden_dim
-        self.q = q
-        self.single_tau = max(single_tau, abs_floor)
-        self.query = nn.Linear(emb_dim, hidden_dim, bias=False)
-        self.key   = nn.Linear(emb_dim, hidden_dim, bias=False)
+        self.key = nn.Linear(emb_dim, hidden_dim, bias=False)
         self.query_norm = nn.LayerNorm(hidden_dim)
         self.key_norm = nn.LayerNorm(hidden_dim)
         self.C_weight = nn.Parameter(torch.ones(1))
         self.F_weight = nn.Parameter(torch.ones(1))
+        self.S_weight = nn.Parameter(torch.ones(1))
         self.C_temp = C_temp
         self.F_temp = F_temp          
+        self.S_temp = S_temp
         self.eps = 1e-6
 
     def query_key(self, x):
@@ -244,33 +205,62 @@ class AttentionLinks(nn.Module):
 
         wC = 2 * torch.sigmoid(self.C_weight)
         wF = 2 * torch.sigmoid(self.F_weight)
+        wS = 2 * torch.sigmoid(self.S_weight)
 
         Gkk = k.transpose(-2, -1) @ k
         Gkq = k.transpose(-2, -1) @ q
+        Gqq = q.transpose(-2, -1) @ q
         
         C_raw = q @ Gkk @ q.transpose(-2, -1)
         F_raw = q @ Gkq @ k.transpose(-2, -1)
+        S_raw = k @ Gqq @ k.transpose(-2, -1)
 
         C = C_raw - C_raw.mean(dim=-1, keepdim=True)
         F = F_raw - F_raw.mean(dim=-1, keepdim=True)
+        S = S_raw - S_raw.mean(dim=-1, keepdim=True)
 
-        pC = torch.clamp(entmax15((wC * C)/C_temp, dim=-1), 0.0, 1.0-self.eps)
-        pF = torch.clamp(entmax15((wF * F)/F_temp, dim=-1), 0.0, 1.0-self.eps)
+        pC = torch.clamp(entmax15((wC * C)/self.C_temp, dim=-1), 0.0, 1.0-self.eps)
+        pF = torch.clamp(entmax15((wF * F)/self.F_temp, dim=-1), 0.0, 1.0-self.eps)
+        pS = torch.clamp(entmax15((wS * S)/self.S_temp, dim=-1), 0.0, 1.0-self.eps)
 
-        col_sum = pC.sum(dim=-2, keepdim=True)
-        dehub = torch.rsqrt(col_sum + self.eps)
-        pC = pC * dehub
+        col_sum_C = pC.sum(dim=-2, keepdim=True)        
+        dehub_C = torch.rsqrt(col_sum_C + self.eps)
+        pC = pC * dehub_C
+
+        col_sum_S = pS.sum(dim=-2, keepdim=True)
+        dehub_S = torch.rsqrt(col_sum_S + self.eps)
+        pS = pS * dehub_S
+
+        pC = (1 - 2*self.eps) * pC + self.eps
+        pF = (1 - 2*self.eps) * pF + self.eps
+        pS = (1 - 2*self.eps) * pS + self.eps
+
+        pC = torch.clamp(pC, self.eps)
+        pF = torch.clamp(pF, self.eps)
+        pS = torch.clamp(pS, self.eps)
         
-        H = (2.0 * pC * pF) / (pC + pF + self.eps)
+        H = (torch.log(pC) + torch.log(pF) + torch.log(pS)) / 3.0
         diag_mask = torch.eye(L, dtype=torch.bool, device=x.device).unsqueeze(0)
         H = H.masked_fill(diag_mask, -torch.inf)
         H = entmax15(H, dim=-1)
 
-        return H, pC, pF
+        return H, pC, pF, pS
 
-class RotateAttention(nn.Module):
-    def __init__(self, emb_dim, hidden_dim, q, single_tau, abs_floor, C_temp, F_temp):
+class FlashLinks(nn.Module):
+    def __init__(self, emb_dim, hidden_dim, C_temp=1.0, F_temp=1.0):
         super().__init__()
-        self.links = AttentionLinks(emb_dim, hidden_dim, q, single_tau, abs_floor, C_temp, F_temp)
+        self.links = FlashAttentionLinks(emb_dim, hidden_dim, C_temp=C_temp, F_temp=F_temp)
+        self.alpha = nn.Parameter(torch.zeros(1))
 
-        
+    def forward(self, x, S, q_continue_logits):
+        B, _, _, _ = S.shape
+        H, _, _, _ = self.links(x)
+
+        p_continue = torch.sigmoid(q_continue_logits)
+        trust_in_prior = 1.0 - p_continue
+        adaptive_weight = F.softplus(self.alpha) * trust_in_prior
+
+        adaptive_weight = adaptive_weight.view(B, 1, 1, 1)
+        S_final = S + adaptive_weight * H.unsqueeze(1)
+
+        return S_final
