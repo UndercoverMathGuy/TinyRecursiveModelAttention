@@ -12,7 +12,7 @@ from entmax import entmax15
 #    from flash_attn import flash_attn_func  # type: ignore[import]
 from torch.nn.functional import scaled_dot_product_attention
 
-from models.common import trunc_normal_init_
+from common import trunc_normal_init_
 
 
 CosSin = Tuple[torch.Tensor, torch.Tensor]
@@ -135,6 +135,42 @@ class Attention(nn.Module):
         attn_output = attn_output.view(batch_size, seq_len, self.output_size)  # type: ignore
         return self.o_proj(attn_output)
 
+class RawAttention(nn.Module):
+    def __init__(self, hidden_size, head_dim, seq_len, causal=False, softmax=False):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.head_dim = head_dim
+        self.causal = causal
+        self.softmax = softmax
+        self.rope = RotaryEmbedding(dim=hidden_size, max_position_embeddings=seq_len, base=10000.0)
+
+        self.q_proj = CastedLinear(self.hidden_size, self.head_dim, bias=False)
+        self.k_proj = CastedLinear(self.hidden_size, self.head_dim, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor):
+        batch_size, seq_len, _ = hidden_states.shape
+
+        query = self.q_proj(hidden_states)
+        key = self.k_proj(hidden_states)
+        
+        # RoPE expects shape [B, L, 1, D] for single head
+        cos, sin = self.rope()
+        query, key = apply_rotary_pos_emb(query.unsqueeze(2), key.unsqueeze(2), cos, sin)
+        query, key = query.squeeze(2), key.squeeze(2)
+
+        attn_scores = torch.bmm(query, key.transpose(-1, -2)) / math.sqrt(self.head_dim)
+
+        if self.causal:
+            mask = torch.full((seq_len, seq_len), float("-inf"), device=query.device)
+            mask = torch.triu(mask, diagonal=1)
+            attn_scores = attn_scores + mask
+
+        if self.softmax:
+            return F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query.dtype)
+        else:
+            return attn_scores
+
+
 class LinearSwish(nn.Module):
     def __init__(self, hidden_size: int, reverse=False):
         super().__init__()
@@ -171,14 +207,19 @@ def rms_norm(hidden_states: torch.Tensor, variance_epsilon: float) -> torch.Tens
     return hidden_states.to(input_dtype)
 
 class FlashAttentionLinks(nn.Module):
-    def __init__ (self, emb_dim, hidden_dim, C_temp=1.0, F_temp=1.0, S_temp=1.0):
+    def __init__ (self, emb_dim, hidden_dim, seq_len, C_temp=1.0, F_temp=1.0, S_temp=1.0):
         super().__init__()
         self.emb_dim = emb_dim
         self.hidden_dim = hidden_dim
-        self.query = nn.Linear(emb_dim, hidden_dim, bias=False)
-        self.key = nn.Linear(emb_dim, hidden_dim, bias=False)
+        
+        self.query = CastedLinear(emb_dim, hidden_dim, bias=False)
+        self.key = CastedLinear(emb_dim, hidden_dim, bias=False)
+        
         self.query_norm = nn.LayerNorm(hidden_dim)
         self.key_norm = nn.LayerNorm(hidden_dim)
+        
+        self.rope = RotaryEmbedding(dim=hidden_dim, max_position_embeddings=seq_len, base=10000.0)
+
         self.C_weight = nn.Parameter(torch.ones(1))
         self.F_weight = nn.Parameter(torch.ones(1))
         self.S_weight = nn.Parameter(torch.ones(1))
@@ -194,8 +235,10 @@ class FlashAttentionLinks(nn.Module):
         q = self.query_norm(q)
         k = self.key_norm(k)
 
-        q = F.normalize(q, p=2, dim=-1, eps=self.eps)
-        k = F.normalize(k, p=2, dim=-1, eps=self.eps)
+        cos, sin = self.rope()
+        q, k = apply_rotary_pos_emb(q.unsqueeze(2), k.unsqueeze(2), cos, sin)
+        q, k = q.squeeze(2), k.squeeze(2)
+
         return q, k
 
     def forward(self, x):
@@ -247,20 +290,21 @@ class FlashAttentionLinks(nn.Module):
         return H, pC, pF, pS
 
 class FlashLinks(nn.Module):
-    def __init__(self, emb_dim, hidden_dim, C_temp=1.0, F_temp=1.0):
+    def __init__(self, emb_dim, hidden_dim, seq_len, C_temp=1.0, F_temp=1.0):
         super().__init__()
-        self.links = FlashAttentionLinks(emb_dim, hidden_dim, C_temp=C_temp, F_temp=F_temp)
+        self.links = FlashAttentionLinks(emb_dim, hidden_dim, seq_len, C_temp=C_temp, F_temp=F_temp)
         self.alpha = nn.Parameter(torch.zeros(1))
 
     def forward(self, x, S, q_continue_logits):
-        B, _, _, _ = S.shape
+        B, L, _ = S.shape
         H, _, _, _ = self.links(x)
 
         p_continue = torch.sigmoid(q_continue_logits)
         trust_in_prior = 1.0 - p_continue
-        adaptive_weight = F.softplus(self.alpha) * trust_in_prior
+        adaptive_weight = torch.tanh(self.alpha) * trust_in_prior
 
-        adaptive_weight = adaptive_weight.view(B, 1, 1, 1)
-        S_final = S + adaptive_weight * H.unsqueeze(1)
+        # Reshape for broadcasting over [B, L, L]
+        adaptive_weight = adaptive_weight.view(B, 1, 1)
+        S_final = S + adaptive_weight * H
 
         return S_final
