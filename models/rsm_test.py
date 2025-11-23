@@ -363,9 +363,92 @@ def train_JAT(epochs, batch_size):
         jat_weights_path,
     )
 
-def load_jat_weights(path):
-    checkpoint = torch.load(path, map_location="mps")
-    model.load_state_dict(checkpoint["model_state_dict"])
+def load_jat_weights(path: str, device: torch.device | str = "mps") -> JATAdjacency:
+    device = torch.device(device)
+    teacher = JATAdjacency(d_model=3, num_heads=1, head_dim=4, order=1, ceof=0.5, num_jat_heads=1)
+    checkpoint = torch.load(path, map_location=device)
+    teacher.load_state_dict(checkpoint["model_state_dict"])
+    teacher.to(device)
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad = False
+    return teacher
+
+
+class RSMStudent(nn.Module):
+    def __init__(self, seq_len: int, emb_dim: int = 8, hidden_dim: int = 16, C_temp: float = 1.0, F_temp: float = 1.0):
+        super().__init__()
+        self.seq_len = seq_len
+        self.in_proj = nn.Linear(3, emb_dim)
+        self.links = FlashLinks(emb_dim=emb_dim, hidden_dim=hidden_dim, seq_len=seq_len, C_temp=C_temp, F_temp=F_temp)
+
+    def forward(self, seq: torch.Tensor) -> torch.Tensor:
+        # seq: [B, L, 3]  (cell_type, row, col)
+        x = self.in_proj(seq)  # [B, L, emb_dim]
+        B, L, _ = x.shape
+        S0 = torch.zeros(B, L, L, device=x.device, dtype=x.dtype)
+        qclogits = torch.zeros(B, device=x.device, dtype=x.dtype)
+        S_final = self.links(x, S0, qclogits)
+        return S_final
+
+
+def train_RSM_distill(epochs: int, batch_size: int, jat_weights_path: str = "jat_weights.pt"):
+    torch.manual_seed(1331)
+    dataset = load_membrane_dataset("membrane_dataset.pt")
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    device = torch.device("mps")
+
+    grids_example = dataset.tensors[0]
+    N = grids_example.size(-1)
+    L = N * N
+
+    # Precompute positional encodings (same as for JAT)
+    rows = torch.linspace(-1.0, 1.0, N)
+    cols = torch.linspace(-1.0, 1.0, N)
+    rr, cc = torch.meshgrid(rows, cols, indexing="ij")
+    pos = torch.stack([rr, cc], dim=-1).view(L, 2).to(device)  # [L, 2]
+
+    teacher = load_jat_weights(jat_weights_path, device=device)
+
+    student = RSMStudent(seq_len=L, emb_dim=8, hidden_dim=16, C_temp=1.0, F_temp=1.0).to(device)
+    optimizer = torch.optim.Adam(student.parameters(), lr=1e-3)
+    criterion = nn.MSELoss(reduction="none")
+
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        total_mask = 0.0
+
+        for batch in dataloader:
+            grids, _, masks = batch
+            B = grids.size(0)
+
+            cell = grids.view(B, -1, 1).to(dtype=torch.float32, device=device)  # [B, L, 1]
+            pos_batch = pos.unsqueeze(0).expand(B, -1, -1)                       # [B, L, 2]
+            seq = torch.cat([cell, pos_batch], dim=-1)                           # [B, L, 3]
+
+            masks_b = masks.to(device)
+
+            with torch.no_grad():
+                teacher_adj = teacher(seq)  # [B, L, L]
+
+            optimizer.zero_grad()
+            student_adj = student(seq)
+
+            sq_err = (student_adj - teacher_adj) ** 2  # [B, L, L]
+            batch_loss_sum = (sq_err * masks_b).sum()
+            batch_mask_sum = masks_b.sum()
+            loss = batch_loss_sum / batch_mask_sum
+
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += batch_loss_sum.item()
+            total_mask += batch_mask_sum.item()
+
+        avg_loss = epoch_loss / max(total_mask, 1.0)
+        print(f"[RSM distill] Epoch {epoch+1}, Loss: {avg_loss}")
+
 
 if __name__ == "__main__":
     alpha = 2
