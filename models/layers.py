@@ -1,18 +1,16 @@
 from typing import Tuple
 import einops
+import math
 import torch
 from torch import nn
 import torch.nn.functional as F
-from entmax import entmax15
-
 #try:
 #    from flash_attn_interface import flash_attn_func  # type: ignore[import]
 #except ImportError:
 #    # Fallback to FlashAttention 2
 #    from flash_attn import flash_attn_func  # type: ignore[import]
 from torch.nn.functional import scaled_dot_product_attention
-
-from common import trunc_normal_init_
+from models.common import trunc_normal_init_
 
 
 CosSin = Tuple[torch.Tensor, torch.Tensor]
@@ -131,45 +129,8 @@ class Attention(nn.Module):
         # flash attn
         query, key, value = map(lambda t: einops.rearrange(t, 'B S H D -> B H S D'), (query, key, value)) # needed for scaled_dot_product_attention but not flash_attn_func
         attn_output = scaled_dot_product_attention(query=query, key=key, value=value, is_causal=self.causal)
-        attn_output = einops.rearrange(attn_output, 'B H S D -> B S H D')
-        attn_output = attn_output.view(batch_size, seq_len, self.output_size)  # type: ignore
+        attn_output = einops.rearrange(attn_output, 'B H S D -> B S (H D)')  # Flatten directly
         return self.o_proj(attn_output)
-
-class RawAttention(nn.Module):
-    def __init__(self, hidden_size, head_dim, seq_len, causal=False, softmax=False):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.head_dim = head_dim
-        self.causal = causal
-        self.softmax = softmax
-        self.rope = RotaryEmbedding(dim=hidden_size, max_position_embeddings=seq_len, base=10000.0)
-
-        self.q_proj = CastedLinear(self.hidden_size, self.head_dim, bias=False)
-        self.k_proj = CastedLinear(self.hidden_size, self.head_dim, bias=False)
-
-    def forward(self, hidden_states: torch.Tensor):
-        batch_size, seq_len, _ = hidden_states.shape
-
-        query = self.q_proj(hidden_states)
-        key = self.k_proj(hidden_states)
-        
-        # RoPE expects shape [B, L, 1, D] for single head
-        cos, sin = self.rope()
-        query, key = apply_rotary_pos_emb(query.unsqueeze(2), key.unsqueeze(2), cos, sin)
-        query, key = query.squeeze(2), key.squeeze(2)
-
-        attn_scores = torch.bmm(query, key.transpose(-1, -2)) / math.sqrt(self.head_dim)
-
-        if self.causal:
-            mask = torch.full((seq_len, seq_len), float("-inf"), device=query.device)
-            mask = torch.triu(mask, diagonal=1)
-            attn_scores = attn_scores + mask
-
-        if self.softmax:
-            return F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query.dtype)
-        else:
-            return attn_scores
-
 
 class LinearSwish(nn.Module):
     def __init__(self, hidden_size: int, reverse=False):
@@ -206,105 +167,153 @@ def rms_norm(hidden_states: torch.Tensor, variance_epsilon: float) -> torch.Tens
     hidden_states = hidden_states * torch.rsqrt(variance + variance_epsilon)
     return hidden_states.to(input_dtype)
 
-class FlashAttentionLinks(nn.Module):
-    def __init__ (self, emb_dim, hidden_dim, seq_len, C_temp=1.0, F_temp=1.0, S_temp=1.0):
+class PositionBias(nn.Module):
+    """
+    Positional biases for every pair of values in attention matrix
+    """
+    def __init__(self, grid_height, grid_width):
         super().__init__()
-        self.emb_dim = emb_dim
-        self.hidden_dim = hidden_dim
+        self.grid_height = grid_height
+        self.grid_width = grid_width
         
-        self.query = CastedLinear(emb_dim, hidden_dim, bias=False)
-        self.key = CastedLinear(emb_dim, hidden_dim, bias=False)
+        max_rel_h = 2 * grid_height - 1
+        max_rel_w = 2 * grid_width - 1
         
-        self.query_norm = nn.LayerNorm(hidden_dim)
-        self.key_norm = nn.LayerNorm(hidden_dim)
+        self.bias_table = nn.Parameter(torch.zeros(max_rel_h, max_rel_w))
+        trunc_normal_init_(self.bias_table, std=0.02)
         
-        self.rope = RotaryEmbedding(dim=hidden_dim, max_position_embeddings=seq_len, base=10000.0)
-
-        self.C_weight = nn.Parameter(torch.ones(1))
-        self.F_weight = nn.Parameter(torch.ones(1))
-        self.S_weight = nn.Parameter(torch.ones(1))
-        self.C_temp = C_temp
-        self.F_temp = F_temp          
-        self.S_temp = S_temp
-        self.eps = 1e-6
-
-    def query_key(self, x):
-        q = self.query(x) 
-        k = self.key(x)
-
-        q = self.query_norm(q)
-        k = self.key_norm(k)
-
-        cos, sin = self.rope()
-        q, k = apply_rotary_pos_emb(q.unsqueeze(2), k.unsqueeze(2), cos, sin)
-        q, k = q.squeeze(2), k.squeeze(2)
-
-        return q, k
-
-    def forward(self, x):
-        _, L, _ = x.shape
-
-        q, k = self.query_key(x)
-
-        wC = 2 * torch.sigmoid(self.C_weight)
-        wF = 2 * torch.sigmoid(self.F_weight)
-        wS = 2 * torch.sigmoid(self.S_weight)
-
-        Gkk = k.transpose(-2, -1) @ k
-        Gkq = k.transpose(-2, -1) @ q
-        Gqq = q.transpose(-2, -1) @ q
+        coords_h = torch.arange(grid_height)
+        coords_w = torch.arange(grid_width)
+        coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing='ij'))
+        coords_flat = coords.reshape(2, -1)
         
-        C_raw = q @ Gkk @ q.transpose(-2, -1)
-        F_raw = q @ Gkq @ k.transpose(-2, -1)
-        S_raw = k @ Gqq @ k.transpose(-2, -1)
-
-        C = C_raw - C_raw.mean(dim=-1, keepdim=True)
-        F = F_raw - F_raw.mean(dim=-1, keepdim=True)
-        S = S_raw - S_raw.mean(dim=-1, keepdim=True)
-
-        pC = torch.clamp(entmax15((wC * C)/self.C_temp, dim=-1), 0.0, 1.0-self.eps)
-        pF = torch.clamp(entmax15((wF * F)/self.F_temp, dim=-1), 0.0, 1.0-self.eps)
-        pS = torch.clamp(entmax15((wS * S)/self.S_temp, dim=-1), 0.0, 1.0-self.eps)
-
-        col_sum_C = pC.sum(dim=-2, keepdim=True)        
-        dehub_C = torch.rsqrt(col_sum_C + self.eps)
-        pC = pC * dehub_C
-
-        col_sum_S = pS.sum(dim=-2, keepdim=True)
-        dehub_S = torch.rsqrt(col_sum_S + self.eps)
-        pS = pS * dehub_S
-
-        pC = (1 - 2*self.eps) * pC + self.eps
-        pF = (1 - 2*self.eps) * pF + self.eps
-        pS = (1 - 2*self.eps) * pS + self.eps
-
-        pC = torch.clamp(pC, self.eps)
-        pF = torch.clamp(pF, self.eps)
-        pS = torch.clamp(pS, self.eps)
+        relative_coords = coords_flat[:, :, None] - coords_flat[:, None, :]
+        relative_coords[0] += grid_height - 1
+        relative_coords[1] += grid_width - 1
         
-        H = (torch.log(pC) + torch.log(pF) + torch.log(pS)) / 3.0
-        diag_mask = torch.eye(L, dtype=torch.bool, device=x.device).unsqueeze(0)
-        H = H.masked_fill(diag_mask, -torch.inf)
-        H = entmax15(H, dim=-1)
-
-        return H, pC, pF, pS
+        self.register_buffer('rel_idx', relative_coords[0] * max_rel_w + relative_coords[1])
+        
+    def forward(self):
+        return self.bias_table.view(-1)[self.rel_idx]
 
 class FlashLinks(nn.Module):
-    def __init__(self, emb_dim, hidden_dim, seq_len, C_temp=1.0, F_temp=1.0):
+    def __init__(self, hidden_size, head_dim, grid_height, grid_width, num_hops = 2, use_entmax = False, eps = 1e-6):
         super().__init__()
-        self.links = FlashAttentionLinks(emb_dim, hidden_dim, seq_len, C_temp=C_temp, F_temp=F_temp)
-        self.alpha = nn.Parameter(torch.zeros(1))
+        self.hidden_size = hidden_size
+        self.head_dim = head_dim
+        self.num_hops = num_hops
+        self.eps = eps
+        self.scale = math.sqrt(head_dim)
+        self.seq_len = grid_height * grid_width
+        
+        self.q_proj = CastedLinear(hidden_size, head_dim, bias=False)
+        self.k_proj = CastedLinear(hidden_size, head_dim, bias=False)
+        self.v_proj = CastedLinear(hidden_size, head_dim, bias=False)
+        
+        self.pos_bias = PositionBias(grid_height, grid_width)
+        
+        self.rope = RotaryEmbedding(dim=head_dim, max_position_embeddings=self.seq_len, base=10000.0)
+        
+        self.fusion_weights = nn.ParameterList([
+            nn.Parameter(torch.ones(3))
+            for _ in range(num_hops)
+        ])
+        self.fusion_bias = nn.ParameterList([
+            nn.Parameter(torch.zeros(1))
+            for _ in range(num_hops)
+        ])
+        
+        self.hop_transforms = nn.ModuleList([
+            CastedLinear(head_dim, head_dim, bias=False)
+            for _ in range(num_hops)
+        ])
+        
+        self.hop_gate = CastedLinear(hidden_size, num_hops, bias=True)
+        self.output_proj = CastedLinear(head_dim, hidden_size, bias=False)
+        self.temperature = nn.Parameter(torch.ones(1))
+        
+    
+    def prob_log(self, p):
+        p = p.clamp(min=self.eps, max=1.0 - self.eps)
+        return torch.log(p / (1 - p + self.eps))
+    
+    def log_prob(self, logit):
+        return torch.sigmoid(logit)
 
-    def forward(self, x, S, q_continue_logits):
-        B, L, _ = S.shape
-        H, _, _, _ = self.links(x)
+    def mat_exp(self, M, h):
+        if h <= 1:
+            return M
+        result = M
+        for _ in range(h - 1):
+            result = torch.bmm(result, M)
+        return result
+    
+    def base_attention(self, Q, K):
+        scores = torch.bmm(Q, K.transpose(-1, -2)) / self.scale
+        scores = scores + self.pos_bias().unsqueeze(0)
+        scores = scores / self.temperature.clamp(min=0.1)
+        A = F.softmax(scores, dim=-1)
+        return A.to(Q.dtype)
 
-        p_continue = torch.sigmoid(q_continue_logits)
-        trust_in_prior = 1.0 - p_continue
-        adaptive_weight = torch.tanh(self.alpha) * trust_in_prior
+    def motif_attention(self, A, hop):
+        A_T = A.transpose(-1, -2)
+        h = hop + 1
+        
+        A_seq = self.mat_exp(A, h)
+        
+        AA_T = torch.bmm(A, A_T)
+        A_coattn = self.mat_exp(AA_T, h)
+        
+        A_T_A = torch.bmm(A_T, A)
+        A_split = self.mat_exp(A_T_A, h)
+        
+        A_seq = A_seq / (A_seq.sum(dim=-1, keepdim=True) + self.eps)
+        A_coattn = A_coattn / (A_coattn.sum(dim=-1, keepdim=True) + self.eps)
+        A_split = A_split / (A_split.sum(dim=-1, keepdim=True) + self.eps)
 
-        # Reshape for broadcasting over [B, L, L]
-        adaptive_weight = adaptive_weight.view(B, 1, 1)
-        S_final = S + adaptive_weight * H
+        return A_seq, A_coattn, A_split
 
-        return S_final
+    
+    def fuse_motifs(self, A_seq, A_coattn, A_split, hop):
+        logit_seq = self.prob_log(A_seq)
+        logit_coattn = self.prob_log(A_coattn)
+        logit_split = self.prob_log(A_split)
+        
+        w = self.fusion_weights[hop]
+        b = self.fusion_bias[hop]
+        
+        fused_logit = b + w[0] * logit_seq + w[1] * logit_coattn + w[2] * logit_split
+        
+        fused_prob = self.log_prob(fused_logit)
+        
+        fused_attn = fused_prob / (fused_prob.sum(dim=-1, keepdim=True) + self.eps)
+        
+        return fused_attn
+    
+    def forward(self, x):
+        Q = self.q_proj(x)
+        K = self.k_proj(x)
+        V = self.v_proj(x)
+        
+        cos, sin = self.rope()
+        Q, K = apply_rotary_pos_emb(Q.unsqueeze(2), K.unsqueeze(2), cos, sin)
+        Q, K = Q.squeeze(2), K.squeeze(2)
+        
+        A = self.base_attention(Q, K)
+        
+        hop_outputs = []
+        for hop in range(self.num_hops):
+            hop_v = self.hop_transforms[hop](V)
+            
+            A_seq, A_coattn, A_split = self.motif_attention(A, hop=hop)
+            
+            fused_attn = self.fuse_motifs(A_seq, A_coattn, A_split, hop)
+            
+            hop_out = torch.bmm(fused_attn, hop_v)
+            hop_outputs.append(hop_out)
+        
+        hop_weights = F.softmax(self.hop_gate(x), dim=-1)
+        stacked = torch.stack(hop_outputs, dim=-1)
+        combined = (stacked * hop_weights.unsqueeze(2)).sum(dim=-1)
+        
+        return self.output_proj(combined)

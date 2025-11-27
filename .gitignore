@@ -1,0 +1,6 @@
+test_all_motifs.py
+TRIADIC_ATTENTION_RESULTS.md
+.venv/
+__pycache__/
+*.pyc
+*.pyo

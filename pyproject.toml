@@ -30,4 +30,5 @@ dependencies = [
     "safetensors==0.7.0",
     "tokenizers==0.22.1",
     "transformers==4.57.1",
+    "matplotlib>=3.10.7",
 ]
