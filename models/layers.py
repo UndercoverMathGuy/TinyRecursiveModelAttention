@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Tuple, List
 import einops
 import math
 import torch
@@ -317,3 +317,85 @@ class FlashLinks(nn.Module):
         combined = (stacked * hop_weights.unsqueeze(2)).sum(dim=-1)
         
         return self.output_proj(combined)
+
+class FlashAttentionLinks(nn.Module):
+    """
+    Blends FlashLinks output (RSM_states) with vanilla attention output.
+    
+    The blending is gated by q_continue_logits from the previous recursion:
+    - High confidence (q_continue_logits > 0) → more FlashLinks signal
+    - Low confidence → more vanilla attention
+    
+    Can be configured to only apply to specific attention heads.
+    """
+    def __init__(self, hidden_size: int, num_heads: int, active_heads: List[int] = None):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        
+        # Which heads to apply blending to (default: all)
+        if active_heads is None:
+            self.active_heads = list(range(num_heads))
+        else:
+            self.active_heads = active_heads
+        
+        # Learnable base blend weight (before q_continue modulation)
+        self.base_weight = nn.Parameter(torch.zeros(1))
+        
+        # Project q_continue_logits [B] -> per-head gate [B, num_active_heads]
+        self.gate_proj = CastedLinear(1, len(self.active_heads), bias=True)
+        
+        # Initialize gate to output ~0 (no blending initially)
+        with torch.no_grad():
+            self.gate_proj.weight.zero_()
+            if self.gate_proj.bias is not None:
+                self.gate_proj.bias.fill_(-2.0)
+    
+    def forward(
+        self, 
+        attn_output: torch.Tensor,  # [B, L, hidden_size] from vanilla attention
+        rsm_states: torch.Tensor,   # [B, L, hidden_size] from FlashLinks
+        q_continue_logits: torch.Tensor  # [B] from previous recursion
+    ) -> torch.Tensor:
+        """
+        Blend attention output with FlashLinks output based on confidence.
+        
+        Args:
+            attn_output: [B, L, hidden_size] - vanilla attention output
+            rsm_states: [B, L, hidden_size] - FlashLinks triadic output
+            q_continue_logits: [B] - confidence logits from previous recursion
+        
+        Returns:
+            blended: [B, L, hidden_size] - blended output
+        """
+        B, L, D = attn_output.shape
+        
+        # Handle first recursion (no previous q_continue_logits)
+        if q_continue_logits is None:
+            return attn_output
+        
+        # Compute per-head blend gates from q_continue_logits
+        # q_continue_logits: [B] -> [B, 1]
+        q_input = q_continue_logits.unsqueeze(-1)  # [B, 1]
+        
+        # Gate projection: [B, 1] -> [B, num_active_heads]
+        head_gates = torch.sigmoid(self.gate_proj(q_input) + self.base_weight)  # [B, num_active_heads]
+        
+        # Reshape attention outputs to per-head format: [B, L, H, D_head]
+        attn_heads = attn_output.view(B, L, self.num_heads, self.head_dim)
+        rsm_heads = rsm_states.view(B, L, self.num_heads, self.head_dim)
+        
+        # Blend only the active heads
+        blended_heads = attn_heads.clone()
+        for i, head_idx in enumerate(self.active_heads):
+            # gate for this head: [B, 1, 1] for broadcasting
+            gate = head_gates[:, i].view(B, 1, 1)
+            # Blend: (1 - gate) * attn + gate * rsm
+            blended_heads[:, :, head_idx, :] = (
+                (1 - gate) * attn_heads[:, :, head_idx, :] + 
+                gate * rsm_heads[:, :, head_idx, :]
+            )
+        
+        # Reshape back to [B, L, hidden_size]
+        return blended_heads.view(B, L, D)
